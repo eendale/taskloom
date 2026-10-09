@@ -1,5 +1,10 @@
 package taskloom
 
+import (
+	"context"
+	"fmt"
+)
+
 func (p *Processor) worker() {
 	defer p.workerWG.Done()
 
@@ -13,14 +18,22 @@ func (p *Processor) worker() {
 
 func (p *Processor) runJob(job Job) {
 	defer func() {
-		if recover() != nil {
+		if r := recover(); r != nil {
 			p.failed.Add(1)
+			p.reportError(fmt.Errorf("taskloom: panic: %v", r))
 		}
 	}()
 
-	err := job.Run(p.runCtx)
-	if err != nil {
+	ctx := p.runCtx
+	if p.jobTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(p.runCtx, p.jobTimeout)
+		defer cancel()
+	}
+
+	if err := job.Run(ctx); err != nil {
 		p.failed.Add(1)
+		p.reportError(err)
 		return
 	}
 	p.completed.Add(1)

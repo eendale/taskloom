@@ -1,70 +1,65 @@
+// Package taskloom provides an in-memory background job processor.
+//
+// Jobs are accepted into a bounded queue and executed by a fixed worker pool.
+// A successful Submit means the job is held in memory only — not durable and
+// not exactly-once. Jobs must observe context cancellation to stop promptly.
 package taskloom
 
 import (
 	"context"
 	"errors"
+	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 var (
-	// ErrQueueFull is returned by Submit when the queue is at capacity.
-	ErrQueueFull = errors.New("taskloom: queue full")
-
-	// ErrClosed is returned by Submit after Shutdown has started.
-	ErrClosed = errors.New("taskloom: processor closed")
-
-	// ErrNotStarted is returned by Submit or Shutdown before Start.
-	ErrNotStarted = errors.New("taskloom: processor not started")
-
-	// ErrAlreadyStarted is returned by Start if called more than once.
+	ErrQueueFull      = errors.New("taskloom: queue full")
+	ErrClosed         = errors.New("taskloom: processor closed")
+	ErrNotStarted     = errors.New("taskloom: processor not started")
 	ErrAlreadyStarted = errors.New("taskloom: already started")
+	ErrNilJob         = errors.New("taskloom: nil job")
 )
 
-const (
-	defaultWorkers  = 1
-	defaultCapacity = 64
-)
+const defaultCapacity = 64
 
-// Job is work executed by a worker. Cancellation is cooperative:
-// Run must observe ctx to stop promptly.
 type Job interface {
 	Run(ctx context.Context) error
 }
 
-// Func adapts a function to the Job interface.
 type Func func(ctx context.Context) error
 
-// Run calls f(ctx).
-func (f Func) Run(ctx context.Context) error {
-	return f(ctx)
-}
+func (f Func) Run(ctx context.Context) error { return f(ctx) }
 
-// Config controls processor capacity and concurrency.
-// Zero values are replaced by defaults.
+// ErrorHandler is called after a job returns an error or panics.
+// It must not block; it runs on a worker goroutine.
+type ErrorHandler func(err error)
+
 type Config struct {
-	Workers  int // concurrent workers; default 1
-	Capacity int // max queued jobs (not counting in-flight); default 64
+	Workers      int           // <=0 means runtime.NumCPU()
+	Capacity     int           // <=0 means 64
+	JobTimeout   time.Duration // 0 means no per-job timeout
+	ErrorHandler ErrorHandler
 }
 
-// Stats is a point-in-time snapshot.
 type Stats struct {
 	Submitted uint64
 	Completed uint64
 	Failed    uint64
+	Dropped   uint64
 	InFlight  int
 	Queued    int
 }
 
-// Processor accepts jobs and runs them in the background.
-// It is in-memory only: a successful Submit means the job was
-// accepted into memory, not durably stored. Taskloom does not
-// guarantee exactly-once execution.
 type Processor struct {
-	workers  int
-	capacity int
+	workers    int
+	capacity   int
+	jobTimeout time.Duration
+	onError    ErrorHandler
 
-	queue chan Job
+	queue   chan Job
+	closing chan struct{}
 
 	mu      sync.Mutex
 	started bool
@@ -75,18 +70,22 @@ type Processor struct {
 
 	workerWG sync.WaitGroup
 	jobWG    sync.WaitGroup
+	submitWG sync.WaitGroup
 
 	submitted atomic.Uint64
 	completed atomic.Uint64
 	failed    atomic.Uint64
+	dropped   atomic.Uint64
 	inFlight  atomic.Int64
 }
 
-// New creates a stopped processor. Call Start before Submit.
 func New(cfg Config) (*Processor, error) {
 	workers := cfg.Workers
 	if workers <= 0 {
-		workers = defaultWorkers
+		workers = runtime.NumCPU()
+		if workers < 1 {
+			workers = 1
+		}
 	}
 	capacity := cfg.Capacity
 	if capacity <= 0 {
@@ -94,14 +93,27 @@ func New(cfg Config) (*Processor, error) {
 	}
 
 	return &Processor{
-		workers:  workers,
-		capacity: capacity,
-		queue:    make(chan Job, capacity),
+		workers:    workers,
+		capacity:   capacity,
+		jobTimeout: cfg.JobTimeout,
+		onError:    cfg.ErrorHandler,
+		queue:      make(chan Job, capacity),
+		closing:    make(chan struct{}),
 	}, nil
 }
 
-// Start launches worker goroutines. Safe to call once.
+// Start launches workers with a background context.
 func (p *Processor) Start() error {
+	return p.StartContext(context.Background())
+}
+
+// StartContext launches workers. Job contexts are derived from ctx;
+// cancelling ctx cancels in-flight jobs but does not shut down the processor.
+func (p *Processor) StartContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -109,7 +121,7 @@ func (p *Processor) Start() error {
 		return ErrAlreadyStarted
 	}
 
-	p.runCtx, p.runCancel = context.WithCancel(context.Background())
+	p.runCtx, p.runCancel = context.WithCancel(ctx)
 	p.started = true
 
 	for i := 0; i < p.workers; i++ {
@@ -119,11 +131,9 @@ func (p *Processor) Start() error {
 	return nil
 }
 
-// Submit enqueues job for later execution.
-// A nil error means the job was accepted into memory only.
 func (p *Processor) Submit(job Job) error {
 	if job == nil {
-		return errors.New("taskloom: nil job")
+		return ErrNilJob
 	}
 
 	p.mu.Lock()
@@ -149,25 +159,102 @@ func (p *Processor) Submit(job Job) error {
 	}
 }
 
-// Stats returns a snapshot of counters and queue depth.
+// SubmitWait blocks until the job is queued, ctx is done, or the processor closes.
+func (p *Processor) SubmitWait(ctx context.Context, job Job) error {
+	if job == nil {
+		return ErrNilJob
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	p.mu.Lock()
+	if !p.started {
+		p.mu.Unlock()
+		return ErrNotStarted
+	}
+	if p.closed {
+		p.mu.Unlock()
+		return ErrClosed
+	}
+	p.submitWG.Add(1)
+	p.jobWG.Add(1)
+	p.mu.Unlock()
+	defer p.submitWG.Done()
+
+	select {
+	case p.queue <- job:
+		p.submitted.Add(1)
+		return nil
+	case <-ctx.Done():
+		p.jobWG.Done()
+		return ctx.Err()
+	case <-p.closing:
+		p.jobWG.Done()
+		return ErrClosed
+	}
+}
+
+// Go submits fn as a job. It matches the ergonomics of errgroup.Group.Go.
+func (p *Processor) Go(fn func(ctx context.Context) error) error {
+	if fn == nil {
+		return ErrNilJob
+	}
+	return p.Submit(Func(fn))
+}
+
+// GoWait is SubmitWait for a function job.
+func (p *Processor) GoWait(ctx context.Context, fn func(ctx context.Context) error) error {
+	if fn == nil {
+		return ErrNilJob
+	}
+	return p.SubmitWait(ctx, Func(fn))
+}
+
+// Wait blocks until all accepted jobs finish or ctx is done.
+func (p *Processor) Wait(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	p.mu.Lock()
+	if !p.started {
+		p.mu.Unlock()
+		return ErrNotStarted
+	}
+	p.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		p.jobWG.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (p *Processor) Stats() Stats {
 	return Stats{
 		Submitted: p.submitted.Load(),
 		Completed: p.completed.Load(),
 		Failed:    p.failed.Load(),
+		Dropped:   p.dropped.Load(),
 		InFlight:  int(p.inFlight.Load()),
 		Queued:    len(p.queue),
 	}
 }
 
-// Shutdown stops accepting new jobs, then waits for queued and
-// in-flight jobs to finish, or until ctx is done.
-//
-// If ctx expires first, remaining queued jobs are not run and
-// Shutdown returns ctx.Err(). In-flight jobs receive cancellation
-// via their context; Shutdown still waits for those Run calls to
-// return so worker goroutines exit.
+// Shutdown stops submissions and drains work, or drops the queue if ctx is done.
 func (p *Processor) Shutdown(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	p.mu.Lock()
 	if !p.started {
 		p.mu.Unlock()
@@ -179,6 +266,7 @@ func (p *Processor) Shutdown(ctx context.Context) error {
 		return nil
 	}
 	p.closed = true
+	close(p.closing)
 	p.mu.Unlock()
 
 	done := make(chan struct{})
@@ -197,6 +285,8 @@ func (p *Processor) Shutdown(ctx context.Context) error {
 		<-done
 	}
 
+	p.submitWG.Wait()
+
 	p.mu.Lock()
 	close(p.queue)
 	p.mu.Unlock()
@@ -206,13 +296,33 @@ func (p *Processor) Shutdown(ctx context.Context) error {
 	return shutdownErr
 }
 
+// Close shuts down with a background context. Safe to defer before Start.
+func (p *Processor) Close() error {
+	p.mu.Lock()
+	started := p.started
+	p.mu.Unlock()
+	if !started {
+		return nil
+	}
+	return p.Shutdown(context.Background())
+}
+
 func (p *Processor) discardQueued() {
 	for {
 		select {
 		case <-p.queue:
+			p.dropped.Add(1)
 			p.jobWG.Done()
 		default:
 			return
 		}
 	}
+}
+
+func (p *Processor) reportError(err error) {
+	if p.onError == nil || err == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	p.onError(err)
 }

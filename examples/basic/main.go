@@ -19,21 +19,21 @@ func main() {
 	if err := p.Start(); err != nil {
 		panic(err)
 	}
+	defer p.Close()
 
 	for i := 1; i <= 5; i++ {
 		n := i
-		err := p.Submit(taskloom.Func(func(ctx context.Context) error {
+		if err := p.Go(func(ctx context.Context) error {
 			fmt.Println("job", n)
 			return nil
-		}))
-		if err != nil {
+		}); err != nil {
 			panic(err)
 		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := p.Shutdown(ctx); err != nil {
+	if err := p.Wait(ctx); err != nil {
 		panic(err)
 	}
 

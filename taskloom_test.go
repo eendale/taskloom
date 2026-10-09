@@ -258,6 +258,9 @@ func TestShutdownDeadlineDropsQueued(t *testing.T) {
 	if queuedRan.Load() != 0 {
 		t.Fatalf("queued jobs ran = %d, want 0", queuedRan.Load())
 	}
+	if p.Stats().Dropped != 3 {
+		t.Fatalf("Dropped = %d, want 3", p.Stats().Dropped)
+	}
 }
 
 func TestConcurrentSubmitAndShutdown(t *testing.T) {
@@ -316,5 +319,206 @@ func TestPanicIsolated(t *testing.T) {
 	stats := p.Stats()
 	if stats.Failed < 1 || stats.Completed < 1 {
 		t.Fatalf("stats = %+v", stats)
+	}
+}
+
+func TestSubmitWait(t *testing.T) {
+	p := startProcessor(t, Config{Workers: 1, Capacity: 1})
+
+	block := make(chan struct{})
+	release := make(chan struct{})
+	_ = p.Submit(Func(func(ctx context.Context) error {
+		close(block)
+		<-release
+		return nil
+	}))
+	<-block
+
+	_ = p.Submit(Func(func(ctx context.Context) error { return nil }))
+
+	queued := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err := p.SubmitWait(context.Background(), Func(func(ctx context.Context) error {
+			close(queued)
+			return nil
+		}))
+		if err != nil {
+			t.Errorf("SubmitWait: %v", err)
+		}
+	}()
+
+	close(release)
+	select {
+	case <-queued:
+	case <-time.After(2 * time.Second):
+		t.Fatal("SubmitWait did not enqueue")
+	}
+	wg.Wait()
+
+	if err := p.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+}
+
+func TestSubmitWaitCancelled(t *testing.T) {
+	p := startProcessor(t, Config{Workers: 1, Capacity: 1})
+
+	block := make(chan struct{})
+	hold := make(chan struct{})
+	_ = p.Submit(Func(func(ctx context.Context) error {
+		close(block)
+		<-hold
+		return nil
+	}))
+	<-block
+	_ = p.Submit(Func(func(ctx context.Context) error { return nil }))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	err := p.SubmitWait(ctx, Func(func(ctx context.Context) error { return nil }))
+	if err != context.DeadlineExceeded {
+		t.Fatalf("SubmitWait = %v, want deadline exceeded", err)
+	}
+
+	close(hold)
+	_ = p.Shutdown(context.Background())
+}
+
+func TestJobTimeout(t *testing.T) {
+	p := startProcessor(t, Config{
+		Workers:    1,
+		Capacity:   4,
+		JobTimeout: 30 * time.Millisecond,
+	})
+
+	errCh := make(chan error, 1)
+	_ = p.Submit(Func(func(ctx context.Context) error {
+		<-ctx.Done()
+		errCh <- ctx.Err()
+		return ctx.Err()
+	}))
+
+	select {
+	case err := <-errCh:
+		if err != context.DeadlineExceeded {
+			t.Fatalf("job ctx = %v, want deadline exceeded", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("job timeout did not fire")
+	}
+
+	_ = p.Shutdown(context.Background())
+}
+
+func TestErrorHandler(t *testing.T) {
+	got := make(chan error, 1)
+	p := startProcessor(t, Config{
+		Workers:  1,
+		Capacity: 4,
+		ErrorHandler: func(err error) {
+			got <- err
+		},
+	})
+
+	want := errors.New("handled")
+	_ = p.Submit(Func(func(ctx context.Context) error { return want }))
+
+	select {
+	case err := <-got:
+		if err != want {
+			t.Fatalf("handler got %v, want %v", err, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("error handler not called")
+	}
+
+	_ = p.Shutdown(context.Background())
+}
+
+func TestWait(t *testing.T) {
+	p := startProcessor(t, Config{Workers: 2, Capacity: 8})
+
+	var ran atomic.Int64
+	for i := 0; i < 6; i++ {
+		_ = p.Submit(Func(func(ctx context.Context) error {
+			ran.Add(1)
+			return nil
+		}))
+	}
+
+	if err := p.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if ran.Load() != 6 {
+		t.Fatalf("ran = %d, want 6", ran.Load())
+	}
+
+	_ = p.Shutdown(context.Background())
+}
+
+func TestGo(t *testing.T) {
+	p := startProcessor(t, Config{Workers: 1, Capacity: 4})
+
+	done := make(chan struct{})
+	if err := p.Go(func(ctx context.Context) error {
+		close(done)
+		return nil
+	}); err != nil {
+		t.Fatalf("Go: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Go job did not run")
+	}
+
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestCloseBeforeStart(t *testing.T) {
+	p, err := New(Config{Workers: 1})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close before Start: %v", err)
+	}
+}
+
+func TestStartContextCancel(t *testing.T) {
+	p, err := New(Config{Workers: 1, Capacity: 4})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := p.StartContext(ctx); err != nil {
+		t.Fatalf("StartContext: %v", err)
+	}
+	defer p.Close()
+
+	started := make(chan struct{})
+	sawCancel := make(chan struct{})
+	_ = p.Go(func(jobCtx context.Context) error {
+		close(started)
+		<-jobCtx.Done()
+		close(sawCancel)
+		return jobCtx.Err()
+	})
+
+	<-started
+	cancel()
+
+	select {
+	case <-sawCancel:
+	case <-time.After(2 * time.Second):
+		t.Fatal("job context was not cancelled")
 	}
 }
